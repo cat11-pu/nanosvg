@@ -2203,6 +2203,13 @@ static void nsvg__pathQuadBezShortTo(NSVGparser* p, float* cpx, float* cpy,
 static float nsvg__sqr(float x) { return x*x; }
 static float nsvg__vmag(float x, float y) { return sqrtf(x*x + y*y); }
 
+// C89-safe finiteness test: rejects NaN and +/-Inf without relying on the
+// C99 isfinite()/isinf()/isnan() macros.
+static int nsvg__isFinite(float x)
+{
+	return x == x && x > -3.402823466e+38f && x < 3.402823466e+38f;
+}
+
 static float nsvg__vecrat(float ux, float uy, float vx, float vy)
 {
 	return (ux*vx + uy*vy) / (nsvg__vmag(ux,uy) * nsvg__vmag(vx,vy));
@@ -2247,7 +2254,13 @@ static void nsvg__pathArcTo(NSVGparser* p, float* cpx, float* cpy, float* args, 
 	dx = x1 - x2;
 	dy = y1 - y2;
 	d = sqrtf(dx*dx + dy*dy);
-	if (d < 1e-6f || rx < 1e-6f || ry < 1e-6f) {
+	// Per the SVG spec, an arc with no length, a zero (or negative, which
+	// was normalized above) radius, or a non-finite radius (e.g. produced
+	// by an exponent that overflows float to infinity) is rendered as a
+	// straight line segment. Guarding the non-finite case keeps the center
+	// parameterization below free of NaN/Inf and the segment count valid.
+	if (d < 1e-6f || rx < 1e-6f || ry < 1e-6f ||
+			!nsvg__isFinite(rx) || !nsvg__isFinite(ry)) {
 		// The arc degenerates to a line
 		nsvg__lineTo(p, x2, y2);
 		*cpx = x2;
@@ -2309,6 +2322,15 @@ static void nsvg__pathArcTo(NSVGparser* p, float* cpx, float* cpy, float* args, 
 	// Split arc into max 90 degree segments.
 	// The loop assumes an iteration per end point (including start and end), this +1.
 	ndivs = (int)(fabsf(da) / (NSVG_PI*0.5f) + 1.0f);
+	// Defensive: a non-finite or non-positive sweep angle cannot produce a
+	// valid segment count, so fall back to a line instead of looping with a
+	// negative/garbage ndivs (which risks out-of-bounds access).
+	if (ndivs <= 0 || !nsvg__isFinite(da)) {
+		nsvg__lineTo(p, x2, y2);
+		*cpx = x2;
+		*cpy = y2;
+		return;
+	}
 	hda = (da / (float)ndivs) / 2.0f;
 	// Fix for ticket #179: division by 0: avoid cotangens around 0 (infinite)
 	if ((hda < 1e-3f) && (hda > -1e-3f))

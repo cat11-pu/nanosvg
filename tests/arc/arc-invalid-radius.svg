@@ -1,0 +1,32 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  Reproduction for malformed arc (A/a) radii.
+  Covers zero, negative, subnormal and float-overflowing radii. Per the SVG
+  arc implementation notes every one of these must degrade to a straight line
+  segment and never crash or emit non-finite geometry.
+-->
+<svg xmlns="http://www.w3.org/2000/svg" width="320" height="240" viewBox="0 0 320 240">
+  <g fill="none" stroke="#000" stroke-width="2">
+    <!-- reference: well-formed arc -->
+    <path d="M10,30 A20,15 0 0 1 60,60"/>
+    <!-- zero radii: straight line -->
+    <path d="M10,80 A0,15 0 0 1 60,110"/>
+    <path d="M10,120 A20,0 0 0 1 60,150"/>
+    <path d="M10,160 A0,0 0 0 1 60,190"/>
+    <!-- negative radii: sign is ignored (fabs), valid arc -->
+    <path d="M90,30 A-20,15 0 0 1 140,60"/>
+    <path d="M90,80 A20,-15 0 0 1 140,110"/>
+    <path d="M90,120 A-20,-15 0 0 1 140,150"/>
+    <!-- subnormal/underflow radius: degrades to a line -->
+    <path d="M170,30 A1e-400,15 0 0 1 220,60"/>
+    <!-- float-overflow radii (become +/-Inf): must degrade to a line -->
+    <path d="M170,80 A1e99,15 0 0 1 220,110"/>
+    <path d="M170,120 A1e30,15 0 0 1 220,150"/>
+    <path d="M170,160 A-1e99,-1e99 0 1 1 220,190"/>
+    <path d="M250,30 A9999999999999999999999999999999999999999,15 0 0 1 300,60"/>
+    <!-- overflow arc embedded between normal segments (shape must survive) -->
+    <path d="M250,120 L260,130 A1e30,15 0 0 1 290,160 L300,170"/>
+    <!-- coincident endpoints: line fallback regardless of radius -->
+    <path d="M250,200 A20,15 0 0 1 250,200"/>
+  </g>
+</svg>
