@@ -414,10 +414,27 @@ typedef struct NSVGgradientData
 	char spread;
 	char units;
 	float xform[6];
+	// Bitmask of attributes that were explicitly specified on this element.
+	// Unset attributes are inherited from the gradient referenced by 'ref'.
+	unsigned int set;
 	int nstops;
 	NSVGgradientStop* stops;
 	struct NSVGgradientData* next;
 } NSVGgradientData;
+
+enum NSVGgradientAttr {
+	NSVG_GRAD_X1		= 1 << 0,
+	NSVG_GRAD_Y1		= 1 << 1,
+	NSVG_GRAD_X2		= 1 << 2,
+	NSVG_GRAD_Y2		= 1 << 3,
+	NSVG_GRAD_CX		= 1 << 4,
+	NSVG_GRAD_CY		= 1 << 5,
+	NSVG_GRAD_R			= 1 << 6,
+	NSVG_GRAD_FX		= 1 << 7,
+	NSVG_GRAD_FY		= 1 << 8,
+	NSVG_GRAD_SPREAD	= 1 << 9,
+	NSVG_GRAD_UNITS		= 1 << 10
+};
 
 typedef struct NSVGattrib
 {
@@ -851,36 +868,86 @@ static NSVGgradientData* nsvg__findGradientData(NSVGparser* p, const char* id)
 	return NULL;
 }
 
+// Resolves a gradient by walking its xlink:href chain. Per the SVG spec, a
+// gradient inherits every attribute it does not specify itself from the
+// referenced gradient (recursively). Coordinates, the spread method, units and
+// the stop list are all inherited. The returned structs are owned by the
+// parser; only the 'set' bitmask and scalar/coordinate fields on 'out' are
+// mutated, the source gradient lists stay untouched.
+static NSVGgradientData* nsvg__resolveGradient(NSVGparser* p, NSVGgradientData* out)
+{
+	NSVGgradientData* ref;
+	NSVGgradientStop* stops = NULL;
+	int nstops = 0, refIter = 0;
+
+	// 'out' is a working copy whose stop list was cleared. Start the walk at
+	// its own parsed definition (the first link in the chain) so that stops
+	// declared directly on this gradient are still found.
+	ref = nsvg__findGradientData(p, out->id);
+	if (ref == NULL)
+		ref = out;
+	while (ref != NULL) {
+		NSVGgradientData* nextRef = NULL;
+
+		if (out->type == NSVG_PAINT_LINEAR_GRADIENT) {
+			if (!(out->set & NSVG_GRAD_X1)) out->linear.x1 = ref->linear.x1;
+			if (!(out->set & NSVG_GRAD_Y1)) out->linear.y1 = ref->linear.y1;
+			if (!(out->set & NSVG_GRAD_X2)) out->linear.x2 = ref->linear.x2;
+			if (!(out->set & NSVG_GRAD_Y2)) out->linear.y2 = ref->linear.y2;
+		} else {
+			if (!(out->set & NSVG_GRAD_CX)) out->radial.cx = ref->radial.cx;
+			if (!(out->set & NSVG_GRAD_CY)) out->radial.cy = ref->radial.cy;
+			if (!(out->set & NSVG_GRAD_R))  out->radial.r  = ref->radial.r;
+			if (!(out->set & NSVG_GRAD_FX)) out->radial.fx = ref->radial.fx;
+			if (!(out->set & NSVG_GRAD_FY)) out->radial.fy = ref->radial.fy;
+		}
+		if (!(out->set & NSVG_GRAD_SPREAD)) out->spread = ref->spread;
+		if (!(out->set & NSVG_GRAD_UNITS))  out->units  = ref->units;
+
+		if (stops == NULL && ref->stops != NULL) {
+			stops = ref->stops;
+			nstops = ref->nstops;
+		}
+
+		if (ref->ref[0] == '\0')
+			break;
+		nextRef = nsvg__findGradientData(p, ref->ref);
+		if (nextRef == NULL || nextRef == ref)
+			break; // missing target or self reference on malformed data
+		ref = nextRef;
+		refIter++;
+		if (refIter > 32)
+			break; // guard against reference cycles on malformed data
+	}
+
+	out->stops = stops;
+	out->nstops = nstops;
+	return stops != NULL ? out : NULL;
+}
+
 static NSVGgradient* nsvg__createGradient(NSVGparser* p, const char* id, const float* localBounds, float *xform, signed char* paintType)
 {
 	NSVGgradientData* data = NULL;
-	NSVGgradientData* ref = NULL;
 	NSVGgradientStop* stops = NULL;
 	NSVGgradient* grad;
+	NSVGgradientData resolved;
 	float ox, oy, sw, sh, sl;
 	int nstops = 0;
-	int refIter;
 
 	data = nsvg__findGradientData(p, id);
 	if (data == NULL) return NULL;
 
-	// TODO: use ref to fill in all unset values too.
-	ref = data;
-	refIter = 0;
-	while (ref != NULL) {
-		NSVGgradientData* nextRef = NULL;
-		if (stops == NULL && ref->stops != NULL) {
-			stops = ref->stops;
-			nstops = ref->nstops;
-			break;
-		}
-		nextRef = nsvg__findGradientData(p, ref->ref);
-		if (nextRef == ref) break; // prevent infite loops on malformed data
-		ref = nextRef;
-		refIter++;
-		if (refIter > 32) break; // prevent infite loops on malformed data
-	}
-	if (stops == NULL) return NULL;
+	// Inherit unset attributes (coordinates, spread method, units, stops) from
+	// the referenced gradient. Work on a copy so the parsed definition stays
+	// reusable for other shapes referencing the same id.
+	resolved = *data;
+	resolved.stops = NULL;
+	resolved.nstops = 0;
+	if (nsvg__resolveGradient(p, &resolved) == NULL)
+		return NULL;
+	data = &resolved;
+	stops = resolved.stops;
+	nstops = resolved.nstops;
 
 	grad = (NSVGgradient*)malloc(sizeof(NSVGgradient) + sizeof(NSVGgradientStop)*(nstops-1));
 	if (grad == NULL) return NULL;
@@ -2738,6 +2805,10 @@ static void nsvg__parseGradient(NSVGparser* p, const char** attr, signed char ty
 		grad->radial.cx = nsvg__coord(50.0f, NSVG_UNITS_PERCENT);
 		grad->radial.cy = nsvg__coord(50.0f, NSVG_UNITS_PERCENT);
 		grad->radial.r = nsvg__coord(50.0f, NSVG_UNITS_PERCENT);
+		// Per the SVG spec, an unspecified focal point defaults to the center.
+		// Mark these as unset so an xlink:href reference can override them.
+		grad->radial.fx = grad->radial.cx;
+		grad->radial.fy = grad->radial.cy;
 	}
 
 	nsvg__xformIdentity(grad->xform);
@@ -2752,26 +2823,36 @@ static void nsvg__parseGradient(NSVGparser* p, const char** attr, signed char ty
 					grad->units = NSVG_OBJECT_SPACE;
 				else
 					grad->units = NSVG_USER_SPACE;
+				grad->set |= NSVG_GRAD_UNITS;
 			} else if (strcmp(attr[i], "gradientTransform") == 0) {
 				nsvg__parseTransform(grad->xform, attr[i + 1]);
 			} else if (strcmp(attr[i], "cx") == 0) {
 				grad->radial.cx = nsvg__parseCoordinateRaw(attr[i + 1]);
+				grad->set |= NSVG_GRAD_CX;
 			} else if (strcmp(attr[i], "cy") == 0) {
 				grad->radial.cy = nsvg__parseCoordinateRaw(attr[i + 1]);
+				grad->set |= NSVG_GRAD_CY;
 			} else if (strcmp(attr[i], "r") == 0) {
 				grad->radial.r = nsvg__parseCoordinateRaw(attr[i + 1]);
+				grad->set |= NSVG_GRAD_R;
 			} else if (strcmp(attr[i], "fx") == 0) {
 				grad->radial.fx = nsvg__parseCoordinateRaw(attr[i + 1]);
+				grad->set |= NSVG_GRAD_FX;
 			} else if (strcmp(attr[i], "fy") == 0) {
 				grad->radial.fy = nsvg__parseCoordinateRaw(attr[i + 1]);
+				grad->set |= NSVG_GRAD_FY;
 			} else if (strcmp(attr[i], "x1") == 0) {
 				grad->linear.x1 = nsvg__parseCoordinateRaw(attr[i + 1]);
+				grad->set |= NSVG_GRAD_X1;
 			} else if (strcmp(attr[i], "y1") == 0) {
 				grad->linear.y1 = nsvg__parseCoordinateRaw(attr[i + 1]);
+				grad->set |= NSVG_GRAD_Y1;
 			} else if (strcmp(attr[i], "x2") == 0) {
 				grad->linear.x2 = nsvg__parseCoordinateRaw(attr[i + 1]);
+				grad->set |= NSVG_GRAD_X2;
 			} else if (strcmp(attr[i], "y2") == 0) {
 				grad->linear.y2 = nsvg__parseCoordinateRaw(attr[i + 1]);
+				grad->set |= NSVG_GRAD_Y2;
 			} else if (strcmp(attr[i], "spreadMethod") == 0) {
 				if (strcmp(attr[i+1], "pad") == 0)
 					grad->spread = NSVG_SPREAD_PAD;
@@ -2779,10 +2860,14 @@ static void nsvg__parseGradient(NSVGparser* p, const char** attr, signed char ty
 					grad->spread = NSVG_SPREAD_REFLECT;
 				else if (strcmp(attr[i+1], "repeat") == 0)
 					grad->spread = NSVG_SPREAD_REPEAT;
-			} else if (strcmp(attr[i], "xlink:href") == 0) {
+				grad->set |= NSVG_GRAD_SPREAD;
+			} else if (strcmp(attr[i], "xlink:href") == 0 ||
+					   strcmp(attr[i], "href") == 0) {
 				const char *href = attr[i+1];
-				strncpy(grad->ref, href+1, 62);
-				grad->ref[62] = '\0';
+				if (href[0] == '#')
+					href++;
+				strncpy(grad->ref, href, 63);
+				grad->ref[63] = '\0';
 			}
 		}
 	}
@@ -2830,7 +2915,9 @@ static void nsvg__parseGradientStop(NSVGparser* p, const char** attr)
 	stop = &grad->stops[idx];
 	stop->color = curAttr->stopColor;
 	stop->color |= (unsigned int)(curAttr->stopOpacity*255) << 24;
-	stop->offset = curAttr->stopOffset;
+	// A stop offset outside [0,1] is clamped per the SVG spec (a negative
+	// offset becomes 0, an offset above 1 becomes 1).
+	stop->offset = nsvg__minf(nsvg__maxf(curAttr->stopOffset, 0.0f), 1.0f);
 }
 
 static void nsvg__startElement(void* ud, const char* el, const char** attr)
