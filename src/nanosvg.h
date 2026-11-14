@@ -664,6 +664,9 @@ static NSVGparser* nsvg__createParser(void)
 	p->attr[0].hasFill = 1;
 	p->attr[0].visible = 1;
     p->attr[0].paintOrder = nsvg__encodePaintOrder(NSVG_PAINT_FILL, NSVG_PAINT_STROKE, NSVG_PAINT_MARKERS);
+	p->alignX = NSVG_ALIGN_MID;
+	p->alignY = NSVG_ALIGN_MID;
+	p->alignType = NSVG_ALIGN_MEET;
 
 	return p;
 
@@ -2705,11 +2708,14 @@ static void nsvg__parseSVG(NSVGparser* p, const char** attr)
 					else if (strstr(attr[i + 1], "xMax") != 0)
 						p->alignX = NSVG_ALIGN_MAX;
 					// Parse X align
-					if (strstr(attr[i + 1], "yMin") != 0)
+					if (strstr(attr[i + 1], "YMin") != 0 ||
+						strstr(attr[i + 1], "yMin") != 0)
 						p->alignY = NSVG_ALIGN_MIN;
-					else if (strstr(attr[i + 1], "yMid") != 0)
+					else if (strstr(attr[i + 1], "YMid") != 0 ||
+							 strstr(attr[i + 1], "yMid") != 0)
 						p->alignY = NSVG_ALIGN_MID;
-					else if (strstr(attr[i + 1], "yMax") != 0)
+					else if (strstr(attr[i + 1], "YMax") != 0 ||
+							 strstr(attr[i + 1], "yMax") != 0)
 						p->alignY = NSVG_ALIGN_MAX;
 					// Parse meet/slice
 					p->alignType = NSVG_ALIGN_MEET;
