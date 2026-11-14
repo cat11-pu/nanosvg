@@ -1121,6 +1121,108 @@ error:
 }
 
 // We roll our own string to float because the std library one uses locale and messes things up.
+
+// One byte per input character. Bit 0: decimal digit. Bit 1: whitespace or
+// comma (path separator). Bit 2: sign. Bit 3: starts a number token.
+static const unsigned char nsvg__charClass[256] = {
+	// 0..31: '\t'=9, '\n'=10, '\v'=11, '\f'=12, '\r'=13 are separators.
+	0,0,0,0,0,0,0,0,0,2,2,2,2,2,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,
+	// 32..47: space=32 separator, '+'=43, ','=44 separator, '-'=45, '.'=46.
+	2,0,0,0,0,0,0,0,0,0,0,12,2,12,8,0,
+	// 48..63: '0'..'9' (48..57) are digits and number starters, '/' and ':'.
+	9,9,9,9,9,9,9,9,9,9,0,0,0,0,0,0,
+	// 64..95: 'E'=69 handled explicitly in the number parser.
+	0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,
+	// 96..127: 'e'=101.
+	0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,
+	// 128..255: not part of any number or separator.
+	0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,
+	0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,
+	0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,
+	0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0
+};
+
+static const double nsvg__pow10Table[23] = {
+	1e0,  1e1,  1e2,  1e3,  1e4,  1e5,  1e6,  1e7,  1e8,  1e9,
+	1e10, 1e11, 1e12, 1e13, 1e14, 1e15, 1e16, 1e17, 1e18, 1e19,
+	1e20, 1e21, 1e22
+};
+
+static double nsvg__pow10(int exp)
+{
+	if (exp >= 0 && exp <= 22)
+		return nsvg__pow10Table[exp];
+	return pow(10.0, (double)exp);
+}
+
+// Parse a floating point number starting at s without an intermediate
+// string. On success returns the value and stores a pointer to the first
+// character that is not part of the number in *endOut. The arithmetic mirrors
+// nsvg__atof() exactly (integer part + fraction / 10^ndigits, then * 10^exp)
+// so results round identically after the caller's float cast.
+static double nsvg__atofRange(const char* s, const char** endOut)
+{
+	const unsigned char* cur = (const unsigned char*)s;
+	double sign = 1.0;
+	double res = 0.0;
+	long long intPart = 0, fracPart = 0;
+	int hasIntPart = 0, hasFracPart = 0;
+
+	if (*cur == '+') {
+		cur++;
+	} else if (*cur == '-') {
+		sign = -1.0;
+		cur++;
+	}
+
+	if (nsvg__charClass[*cur] & 1) {
+		do {
+			intPart = intPart * 10 + (*cur - '0');
+			cur++;
+		} while (nsvg__charClass[*cur] & 1);
+		res = (double)intPart;
+		hasIntPart = 1;
+	}
+
+	if (*cur == '.') {
+		const unsigned char* fracStart = ++cur;
+		if (nsvg__charClass[*cur] & 1) {
+			do {
+				fracPart = fracPart * 10 + (*cur - '0');
+				cur++;
+			} while (nsvg__charClass[*cur] & 1);
+			res += (double)fracPart / nsvg__pow10((int)(cur - fracStart));
+			hasFracPart = 1;
+		}
+	}
+
+	if (!hasIntPart && !hasFracPart) {
+		*endOut = (const char*)cur;
+		return 0.0;
+	}
+
+	if (*cur == 'e' || *cur == 'E') {
+		const unsigned char* expStart = cur + 1;
+		int expSign = 1;
+		long expPart = 0;
+		if (*expStart == '-' || *expStart == '+') {
+			if (*expStart == '-') expSign = -1;
+			expStart++;
+		}
+		if (nsvg__charClass[*expStart] & 1) {
+			do {
+				expPart = expPart * 10 + (*expStart - '0');
+				expStart++;
+			} while (nsvg__charClass[*expStart] & 1);
+			res *= nsvg__pow10(expSign * (int)expPart);
+			cur = expStart;
+		}
+	}
+
+	*endOut = (const char*)cur;
+	return res * sign;
+}
+
 static double nsvg__atof(const char* s)
 {
 	char* cur = (char*)s;
@@ -1223,19 +1325,55 @@ static const char* nsvg__parseNumber(const char* s, char* it, const int size)
 	return s;
 }
 
-static const char* nsvg__getNextPathItemWhenArcFlag(const char* s, char* it)
+// A single path-data token: either a command letter or a fully parsed number.
+// Keeping the value alongside the tag removes the need to copy number text
+// into a scratch buffer and re-parse it with nsvg__atof().
+typedef struct {
+	char isNumber;	// 1 for a coordinate, 0 for a command letter.
+	char command;	// Valid when isNumber == 0.
+	float value;	// Valid when isNumber == 1.
+} NSVGpathToken;
+
+// Return the next path-data token. Arc flags (the 4th and 5th 'a'/'A'
+// arguments) are single 0/1 digits; keepFlag distinguishes that case so that
+// a following number is not swallowed as part of the flag.
+static const char* nsvg__nextPathToken(const char* s, NSVGpathToken* tok, int keepFlag)
 {
-	it[0] = '\0';
-	while (*s && (nsvg__isspace(*s) || *s == ',')) s++;
-	if (!*s) return s;
-	if (*s == '0' || *s == '1') {
-		it[0] = *s++;
-		it[1] = '\0';
-		return s;
+	const unsigned char* cur = (const unsigned char*)s;
+
+	// Skip white spaces and commas via the lookup table (single branch).
+	while (nsvg__charClass[*cur] & 2)
+		cur++;
+
+	if (*cur == '\0') {
+		tok->isNumber = 0;
+		tok->command = '\0';
+		return (const char*)cur;
 	}
-	return s;
+
+	if (keepFlag && (*cur == '0' || *cur == '1')) {
+		tok->isNumber = 1;
+		tok->value = (float)(*cur - '0');
+		cur++;
+		return (const char*)cur;
+	}
+
+	if (nsvg__charClass[*cur] & 8) {
+		const char* end;
+		tok->isNumber = 1;
+		tok->value = (float)nsvg__atofRange((const char*)cur, &end);
+		return end;
+	}
+
+	// Anything else is a single-character command.
+	tok->isNumber = 0;
+	tok->command = (char)*cur;
+	cur++;
+	return (const char*)cur;
 }
 
+// String-based wrapper retained for the remaining non-path call sites
+// (polyline/polygon points and matrix transforms).
 static const char* nsvg__getNextPathItem(const char* s, char* it)
 {
 	it[0] = '\0';
@@ -1538,15 +1676,6 @@ static int nsvg__parseUnits(const char* units)
 	else if (units[0] == 'e' && units[1] == 'x')
 		return NSVG_UNITS_EX;
 	return NSVG_UNITS_USER;
-}
-
-static int nsvg__isCoordinate(const char* s)
-{
-	// optional sign
-	if (*s == '-' || *s == '+')
-		s++;
-	// must have at least one digit, or start by a dot
-	return (nsvg__isdigit(*s) || *s == '.');
 }
 
 static NSVGcoordinate nsvg__parseCoordinateRaw(const char* str)
@@ -2349,7 +2478,7 @@ static void nsvg__parsePath(NSVGparser* p, const char** attr)
 	const char* tmp[4];
 	char closedFlag;
 	int i;
-	char item[64];
+	NSVGpathToken token = { 0, '\0', 0.0f };
 
 	for (i = 0; attr[i]; i += 2) {
 		if (strcmp(attr[i], "d") == 0) {
@@ -2372,15 +2501,12 @@ static void nsvg__parsePath(NSVGparser* p, const char** attr)
 		nargs = 0;
 
 		while (*s) {
-			item[0] = '\0';
-			if ((cmd == 'A' || cmd == 'a') && (nargs == 3 || nargs == 4))
-				s = nsvg__getNextPathItemWhenArcFlag(s, item);
-			if (!*item)
-				s = nsvg__getNextPathItem(s, item);
-			if (!*item) break;
-			if (cmd != '\0' && nsvg__isCoordinate(item)) {
+			int keepFlag = (cmd == 'A' || cmd == 'a') && (nargs == 3 || nargs == 4);
+			s = nsvg__nextPathToken(s, &token, keepFlag);
+			if (!token.isNumber && token.command == '\0') break;
+			if (cmd != '\0' && token.isNumber) {
 				if (nargs < 10)
-					args[nargs++] = (float)nsvg__atof(item);
+					args[nargs++] = token.value;
 				if (nargs >= rargs) {
 					switch (cmd) {
 						case 'm':
@@ -2440,7 +2566,7 @@ static void nsvg__parsePath(NSVGparser* p, const char** attr)
 					nargs = 0;
 				}
 			} else {
-				cmd = item[0];
+				cmd = token.command;
 				if (cmd == 'M' || cmd == 'm') {
 					// Commit path.
 					if (p->npts > 0)
